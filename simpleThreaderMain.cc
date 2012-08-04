@@ -10,6 +10,7 @@
 
 #include <pthread.h>
 #include <time.h>
+#include <stdint.h> // uint32_t et al
 
 #include <CmdLineParser.h>
 

@@ -38,7 +38,7 @@ Checkpoint* Checkpoint::instance()
 {
   if(instance_ == 0)
   {
-	Checkpoint::initialize();
+    Checkpoint::initialize();
   }
 
   return instance_;
@@ -62,57 +62,39 @@ Checkpoint::Checkpoint(uint32_t numCores) :
   pthread_mutex_init(&checkpointLock_, NULL); // initialize it even if !useLocking_
   pthread_rwlock_init(&threadIdMapRwLock_, NULL);
 
-  memset(lipInfo_, 0, sizeof(lipInfo_));
-
-  uint64_t cycles(getCycles());
-  struct coreInfo *coreCp(lipInfo_);
-  for(int core = 0; core < MAX_CORES; coreCp = &(lipInfo_[++core]))
-  {
-    coreCp->lastCheckpointHit_ = 0;
-    struct chkInfo *arrayOfCore(coreCp->checkpoints_);
-    for(int i = 0; i < MAX_CHK; ++i)
-    {
-      arrayOfCore[i].previousCycles_ = cycles;
-      arrayOfCore[i].totalCycles_ = 0;
-      arrayOfCore[i].iterations_ = 0;
-    }
-  }
+  // Set the initial vector size to numCores, it will grow dynamically if needed
+  coreCpInfoVector_.reserve(numCores);
 }
 
-uint32_t Checkpoint::getCoreNum()
+// private
+Checkpoint::CoreCheckpointInfo *Checkpoint::getCoreCpInfo()
 {
-  uint32_t coreNum(0);
   pthread_t threadId(pthread_self());
+  CoreCheckpointInfo *coreCpInfo(NULL);
 
   pthread_rwlock_rdlock(&threadIdMapRwLock_);
   Checkpoint::ThreadIdMapType::iterator iter = threadIdMap_.find(threadId);
 
   if(iter != threadIdMap_.end())
   {
-    coreNum = iter->second;
+    coreCpInfo = &(coreCpInfoVector_[iter->second]);
     pthread_rwlock_unlock(&threadIdMapRwLock_);
   }
   else
   {
-    if(threadIdCounter_ > MAX_CORES)
-    {
-      // TODO maybe in this case we should just return 0
-      cerr << "*** ERROR *** exceeded the max number of threads: " << MAX_CORES
-           << "\nMemory corruption imminent!"
-           << endl;
-    }
-
     // release the read lock
     pthread_rwlock_unlock(&threadIdMapRwLock_);
 
     // get a write lock, since we'll have to modify the map
     pthread_rwlock_wrlock(&threadIdMapRwLock_);
-      coreNum = threadIdCounter_;
-      threadIdMap_[threadId] = threadIdCounter_++;
+      // Combine the threadIdMap_ and coreCpInfoVector_ into just one map
+      threadIdMap_[threadId] = threadIdCounter_;
+      coreCpInfoVector_[threadIdCounter_] = CoreCheckpointInfo();
+      coreCpInfo = &(coreCpInfoVector_[threadIdCounter_++]);
     pthread_rwlock_unlock(&threadIdMapRwLock_);
   }
 
-  return coreNum;
+  return coreCpInfo;
 }
 
 
@@ -125,9 +107,9 @@ void Checkpoint::checkpoint(int checkpoint)
 
   // Not checking coreNum nor checkpoint for performance reasons
 
-  struct coreInfo *coreCp     (  &(lipInfo_[getCoreNum()]) );
-  struct chkInfo *currentCp   (  &(coreCp->checkpoints_[checkpoint]) );
-  struct chkInfo *previousCp  (  &(coreCp->checkpoints_[coreCp->lastCheckpointHit_]) );
+  CoreCheckpointInfo *coreCp  (  getCoreCpInfo() );
+  CheckpointInfo *currentCp   (  &(coreCp->checkpoints_[checkpoint]) );
+  CheckpointInfo *previousCp  (  &(coreCp->checkpoints_[coreCp->lastCheckpointHit_]) );
   coreCp->lastCheckpointHit_  =  checkpoint;
 
   if(__unlikely(useLocking_)) {
@@ -161,15 +143,15 @@ void Checkpoint::dump()
     pthread_mutex_lock(&checkpointLock_);
   }
 
-  struct coreInfo *coreCp(lipInfo_);
-  struct chkInfo totalCpAvg[MAX_CHK];
+  CoreCheckpointInfo *coreCp(&(coreCpInfoVector_[0]));
+  CheckpointInfo totalCpAvg[MAX_CHK];
   uint32_t numCpHits[MAX_CHK];
   memset(numCpHits, 0, sizeof(uint32_t)*MAX_CHK);
 
-  for(int core = 0; core < MAX_CORES; coreCp = &(lipInfo_[++core]))
+  for(int core = 0; core < threadIdCounter_; coreCp = &(coreCpInfoVector_[++core]))
   {
     bool coreUsed(false);
-    struct chkInfo *currentCp(coreCp->checkpoints_);
+    CheckpointInfo *currentCp(coreCp->checkpoints_);
     for(int chkPoint=0; chkPoint < MAX_CHK; currentCp = &(coreCp->checkpoints_[++chkPoint]))
     {
       if(currentCp->iterations_ != 0)
@@ -180,7 +162,7 @@ void Checkpoint::dump()
 
     if(!coreUsed)
     {
-      //cout << "CORE [" << c << "] No checkpoints hit on this core, skipping\n" << endl;
+      //cout << "CORE [" << core << "] No checkpoints hit on this core, skipping\n" << endl;
       continue;
     }
 
@@ -226,7 +208,7 @@ void Checkpoint::dump()
   // Now print the averages
   for(int i = 0; i < MAX_CHK; ++i)
   {
-    struct chkInfo *avgCp = &(totalCpAvg[i]);
+    CheckpointInfo *avgCp = &(totalCpAvg[i]);
     if(numCpHits[i] > 1)
     {
       avgCp->totalCycles_ = avgCp->totalCycles_/numCpHits[i];
