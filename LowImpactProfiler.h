@@ -16,8 +16,8 @@ using namespace std;
 class Checkpoint
 {
   public:
-    static const int MAX_CHK=10;
-    static const int DEFAULT_MAX_CORES=32;
+    static const int MAX_CHECKPOINT=10;
+    static const int DEFAULT_MAX_THREADS=32;
     static const string SECOND_STR;
     static const string MICRO_SEC_STR;
     static const string NANO_SEC_STR;
@@ -25,17 +25,16 @@ class Checkpoint
     // Allow Checkpoints to not start gathering until ordered to do so
     inline void setActive(bool active) { isActive_ = active; }
 
-    void setNumCores(int numCores);
+    void setNumThreads(int numThreads);
 
     // The Checkpoint object is a singleton, this method obtains the instance
     static Checkpoint* instance();
 
     // Both instance() and initialize() will initialize the checkpoints
     // but Init provides more flexibility
-    // - If not interested in HW registers, set to false to make a checkpoint more performant
     // - locking is only necessary if dump() will be called while checkpoints are being taken
     //   If dump() will only be called at the end, then set false for increased performance
-    static void initialize(uint32_t numCores = DEFAULT_MAX_CORES, bool useLocking = true);
+    static void initialize(uint32_t numThreads = DEFAULT_MAX_THREADS, bool useLocking = true);
 
     // Gather checkpoint info for the specified checkpoint
     void checkpoint(int checkpoint);
@@ -44,14 +43,6 @@ class Checkpoint
     void dump();
 
   private:
-    // returns nanoseconds since the epoch
-    // TODO make sure putting both the seconds and ns in a uint64_t doesnt overflow it
-    static inline uint64_t getCycles() {
-      struct timespec now;
-      clock_gettime(CLOCK_THREAD_CPUTIME_ID, &now);
-      return (now.tv_sec * 1000000000) + now.tv_nsec;
-    }
-
     typedef struct CheckpointInfo_s {
       uint64_t iterations_;
       uint64_t totalCycles_;
@@ -66,31 +57,45 @@ class Checkpoint
       }
     } CheckpointInfo;
 
-    typedef struct CoreCheckpointInfo_s {
-      CheckpointInfo checkpoints_[MAX_CHK];
+    typedef struct ThreadCheckpointInfo_s {
+      CheckpointInfo checkpoints_[MAX_CHECKPOINT];
       uint32_t lastCheckpointHit_;
-      CoreCheckpointInfo_s() : lastCheckpointHit_(0) {}
-    } CoreCheckpointInfo;
+      ThreadCheckpointInfo_s() : lastCheckpointHit_(0) {}
+    } ThreadCheckpointInfo;
 
-    CoreCheckpointInfo *getCoreCpInfo();
+    // internally gets the threadId and returns the corresponding ThreadCheckpointInfo
+    // uses a rw lock for internal attribute protection
+    ThreadCheckpointInfo *getThreadCpInfo();
+
+    // returns nanoseconds since the epoch
+    // TODO make sure putting both the seconds and ns in a uint64_t doesnt overflow it
+    static inline uint64_t getCycles() {
+      struct timespec now;
+      clock_gettime(CLOCK_THREAD_CPUTIME_ID, &now);
+      return (now.tv_sec * 1000000000) + now.tv_nsec;
+    }
+
+    // returns one of SECOND_STR, MICRO_SEC_STR, or NANO_SEC_STR
+    static const char *getTimeResolutionStr(uint64_t &avgCycles, uint64_t &totalCycles);
 
     static Checkpoint* instance_;
     static bool useLocking_;
 
-    typedef vector<CoreCheckpointInfo> CoreCpInfoVectorType;
-    CoreCpInfoVectorType coreCpInfoVector_;
+    // Map threadId to ThreadCheckpointInfo
+    typedef map<pthread_t, ThreadCheckpointInfo> ThreadCpInfoMapType;
+    ThreadCpInfoMapType threadCpInfoMap_;
+    pthread_rwlock_t threadCpInfoMapRwLock_;
 
-    typedef map<pthread_t, uint32_t> ThreadIdMapType;
-    ThreadIdMapType threadIdMap_;
-    pthread_rwlock_t threadIdMapRwLock_;
+    typedef vector<pthread_t> ThreadIdVectorType;
+    ThreadIdVectorType threadIdVector_;
 
     pthread_mutex_t checkpointLock_;
     uint32_t threadIdCounter_;
-    int numCores_;
+    int numThreads_;
     bool isActive_;
 
   protected:
-    Checkpoint(uint32_t numCores);
+    Checkpoint(uint32_t numThreads);
 };
 
 //

@@ -19,21 +19,19 @@ using namespace std;
 
 // static
 // Singleton method to create/retrieve Checkpoint object
-// Must be called the first time from somewhere where all cores will execute, like main().
-// If its called for the first time from the DataPlane() the ControlPlane() core 0 wont hit it.
-void Checkpoint::initialize(uint32_t numCores, bool useLocking) /* default values: MAX_CORES, true */
+// This method is not thread-safe, so it must be called before the threads are started
+void Checkpoint::initialize(uint32_t numThreads, bool useLocking) /* default values: DEFAULT_MAX_THREADS, true */
 {
   Checkpoint::useLocking_ = useLocking;
   if(instance_ == 0)
   {
-    instance_ = new Checkpoint(numCores);
+    instance_ = new Checkpoint(numThreads);
   }
 }
 
 // static
 // Singleton method to create/retrieve Checkpoint object
-// Must be called the first time from somewhere where all cores will execute, like main().
-// If its called for the first time from the DataPlane() the ControlPlane() core 0 wont hit it.
+// If called before initializing, then initialize() will be called
 Checkpoint* Checkpoint::instance()
 {
   if(instance_ == 0)
@@ -45,8 +43,8 @@ Checkpoint* Checkpoint::instance()
 }
 
 // protected
-Checkpoint::Checkpoint(uint32_t numCores) :
-    numCores_(numCores),
+Checkpoint::Checkpoint(uint32_t numThreads) :
+    numThreads_(numThreads),
     isActive_(true),
     threadIdCounter_(0)
 {
@@ -54,47 +52,45 @@ Checkpoint::Checkpoint(uint32_t numCores) :
   int retval(clock_getcpuclockid(0, &clockId));
   if(retval != 0)
   {
-	  cout << "NOTICE: clock_getcpuclock() returned error: " << retval
-           << "\nThis may be an indication that the time on different CPU cores may not be consistent"
-           << endl;
+    cout << "NOTICE: clock_getcpuclock() returned error: " << retval
+         << "\nThis may be an indication that the time on different CPU cores may not be consistent"
+         << endl;
   }
 
   pthread_mutex_init(&checkpointLock_, NULL); // initialize it even if !useLocking_
-  pthread_rwlock_init(&threadIdMapRwLock_, NULL);
+  pthread_rwlock_init(&threadCpInfoMapRwLock_, NULL);
 
-  // Set the initial vector size to numCores, it will grow dynamically if needed
-  coreCpInfoVector_.reserve(numCores);
+  threadIdVector_.reserve(numThreads);
 }
 
 // private
-Checkpoint::CoreCheckpointInfo *Checkpoint::getCoreCpInfo()
+Checkpoint::ThreadCheckpointInfo *Checkpoint::getThreadCpInfo()
 {
   pthread_t threadId(pthread_self());
-  CoreCheckpointInfo *coreCpInfo(NULL);
+  ThreadCheckpointInfo *threadCpInfo(NULL);
 
-  pthread_rwlock_rdlock(&threadIdMapRwLock_);
-  Checkpoint::ThreadIdMapType::iterator iter = threadIdMap_.find(threadId);
+  pthread_rwlock_rdlock(&threadCpInfoMapRwLock_);
+  Checkpoint::ThreadCpInfoMapType::iterator iter(threadCpInfoMap_.find(threadId));
 
-  if(iter != threadIdMap_.end())
+  if(iter != threadCpInfoMap_.end())
   {
-    coreCpInfo = &(coreCpInfoVector_[iter->second]);
-    pthread_rwlock_unlock(&threadIdMapRwLock_);
+    threadCpInfo = &(iter->second);
+    pthread_rwlock_unlock(&threadCpInfoMapRwLock_);
   }
   else
   {
     // release the read lock
-    pthread_rwlock_unlock(&threadIdMapRwLock_);
+    pthread_rwlock_unlock(&threadCpInfoMapRwLock_);
 
     // get a write lock, since we'll have to modify the map
-    pthread_rwlock_wrlock(&threadIdMapRwLock_);
-      // Combine the threadIdMap_ and coreCpInfoVector_ into just one map
-      threadIdMap_[threadId] = threadIdCounter_;
-      coreCpInfoVector_[threadIdCounter_] = CoreCheckpointInfo();
-      coreCpInfo = &(coreCpInfoVector_[threadIdCounter_++]);
-    pthread_rwlock_unlock(&threadIdMapRwLock_);
+    pthread_rwlock_wrlock(&threadCpInfoMapRwLock_);
+      threadIdVector_[threadIdCounter_++] = threadId;
+      threadCpInfoMap_[threadId] = ThreadCheckpointInfo();
+      threadCpInfo = &(threadCpInfoMap_[threadId]);
+    pthread_rwlock_unlock(&threadCpInfoMapRwLock_);
   }
 
-  return coreCpInfo;
+  return threadCpInfo;
 }
 
 
@@ -105,12 +101,12 @@ void Checkpoint::checkpoint(int checkpoint)
     return;
   }
 
-  // Not checking coreNum nor checkpoint for performance reasons
+  // Not checking threadNum nor checkpoint for performance reasons
 
-  CoreCheckpointInfo *coreCp  (  getCoreCpInfo() );
-  CheckpointInfo *currentCp   (  &(coreCp->checkpoints_[checkpoint]) );
-  CheckpointInfo *previousCp  (  &(coreCp->checkpoints_[coreCp->lastCheckpointHit_]) );
-  coreCp->lastCheckpointHit_  =  checkpoint;
+  ThreadCheckpointInfo *threadCp (  getThreadCpInfo() );
+  CheckpointInfo *currentCp      (  &(threadCp->checkpoints_[checkpoint]) );
+  CheckpointInfo *previousCp     (  &(threadCp->checkpoints_[threadCp->lastCheckpointHit_]) );
+  threadCp->lastCheckpointHit_  =  checkpoint;
 
   if(__unlikely(useLocking_)) {
     pthread_mutex_lock(&checkpointLock_);
@@ -122,14 +118,34 @@ void Checkpoint::checkpoint(int checkpoint)
   currentCp->totalCycles_   += (currentCp->previousCycles_ - previousCp->previousCycles_);
 
   if(__unlikely(useLocking_)) {
-	  pthread_mutex_unlock(&checkpointLock_);
+    pthread_mutex_unlock(&checkpointLock_);
   }
+}
+
+const char *Checkpoint::getTimeResolutionStr(uint64_t &avgCycles, uint64_t &totalCycles)
+{
+  const char *unitPtr(Checkpoint::NANO_SEC_STR.c_str());
+
+  if(avgCycles > 999999 && totalCycles > 9999999)
+  {
+    totalCycles /= 1000000000;
+    avgCycles   /= 1000000000;
+    unitPtr = Checkpoint::SECOND_STR.c_str();
+  }
+  else if(avgCycles > 9999 && totalCycles > 99999)
+  {
+    totalCycles /= 1000;
+    avgCycles   /= 1000;
+    unitPtr = Checkpoint::MICRO_SEC_STR.c_str();
+  }
+
+  return unitPtr;
 }
 
 // Dump all the checkpoint information
 void Checkpoint::dump()
 {
-  cout << "Number of Cores [configured, used] = [" << numCores_
+  cout << "Number of Threads [configured, used] = [" << numThreads_
        << ", " << threadIdCounter_
        << "]"
        << endl;
@@ -143,31 +159,50 @@ void Checkpoint::dump()
     pthread_mutex_lock(&checkpointLock_);
   }
 
-  CoreCheckpointInfo *coreCp(&(coreCpInfoVector_[0]));
-  CheckpointInfo totalCpAvg[MAX_CHK];
-  uint32_t numCpHits[MAX_CHK];
-  memset(numCpHits, 0, sizeof(uint32_t)*MAX_CHK);
+  CheckpointInfo totalCpAvg[MAX_CHECKPOINT];
+  uint32_t numCpHits[MAX_CHECKPOINT];
+  memset(numCpHits, 0, sizeof(uint32_t)*MAX_CHECKPOINT);
 
-  for(int core = 0; core < threadIdCounter_; coreCp = &(coreCpInfoVector_[++core]))
+  // Iterate over the vector and index the map, because if we iterate the map
+  // the key is the threadId and the threads will be ordered by the threadId
+  for(int thread = 0; thread < threadIdCounter_; ++thread)
   {
-    bool coreUsed(false);
-    CheckpointInfo *currentCp(coreCp->checkpoints_);
-    for(int chkPoint=0; chkPoint < MAX_CHK; currentCp = &(coreCp->checkpoints_[++chkPoint]))
+    ThreadCheckpointInfo *threadCp = &(threadCpInfoMap_[threadIdVector_[thread]]);
+
+    // Filter out unused threads
+    bool threadUsed(false);
+    CheckpointInfo *currentCp(threadCp->checkpoints_);
+    for(int chkPoint=0; chkPoint < MAX_CHECKPOINT; currentCp = &(threadCp->checkpoints_[++chkPoint]))
     {
       if(currentCp->iterations_ != 0)
       {
-        coreUsed = true;
+        threadUsed = true;
       }
     }
 
-    if(!coreUsed)
+    if(!threadUsed)
     {
-      //cout << "CORE [" << core << "] No checkpoints hit on this core, skipping\n" << endl;
+      //cout << "Thread [" << thread << "] No checkpoints hit on this thread, skipping\n" << endl;
       continue;
     }
 
-    currentCp = coreCp->checkpoints_;
-    for(int chkPoint=0; chkPoint < MAX_CHK; currentCp = &(coreCp->checkpoints_[++chkPoint]))
+    // Filter out unused checkpoints
+    int maxCpIndex(MAX_CHECKPOINT);
+    currentCp = &(threadCp->checkpoints_[MAX_CHECKPOINT-1]);
+    for(int chkPoint=MAX_CHECKPOINT; chkPoint > 0; currentCp = &(threadCp->checkpoints_[--chkPoint]))
+    {
+      if(currentCp->iterations_ == 0)
+      {
+        maxCpIndex = chkPoint;
+      }
+      else
+      {
+        break;
+      }
+    }
+
+    currentCp = threadCp->checkpoints_;
+    for(int chkPoint=0; chkPoint < maxCpIndex; currentCp = &(threadCp->checkpoints_[++chkPoint]))
     {
       uint64_t avgCycles(0);
 
@@ -179,23 +214,10 @@ void Checkpoint::dump()
         numCpHits[chkPoint]++;
       }
 
-      const char *unitPtr(Checkpoint::NANO_SEC_STR.c_str());
       uint64_t totalCycles(currentCp->totalCycles_);
+      const char *unitPtr(getTimeResolutionStr(avgCycles, totalCycles));
 
-      if(avgCycles > 999999 && totalCycles > 9999999)
-      {
-        totalCycles /= 1000000000;
-        avgCycles   /= 1000000000;
-        unitPtr = Checkpoint::SECOND_STR.c_str();
-      }
-      else if(avgCycles > 9999 && totalCycles > 99999)
-      {
-   	    totalCycles /= 1000;
-        avgCycles   /= 1000;
-   	    unitPtr = Checkpoint::MICRO_SEC_STR.c_str();
-      }
-
-      cout << "CORE [" << core
+      cout << "Thread [" << thread
            << "] Checkpoint [" << chkPoint
            << "] Iterations [" << currentCp->iterations_
            << "] Time [Unit,Avg,Total] = [" << unitPtr
@@ -206,7 +228,7 @@ void Checkpoint::dump()
   }
 
   // Now print the averages
-  for(int i = 0; i < MAX_CHK; ++i)
+  for(int i = 0; i < MAX_CHECKPOINT; ++i)
   {
     CheckpointInfo *avgCp = &(totalCpAvg[i]);
     if(numCpHits[i] > 1)
@@ -214,22 +236,9 @@ void Checkpoint::dump()
       avgCp->totalCycles_ = avgCp->totalCycles_/numCpHits[i];
       avgCp->iterations_ = avgCp->iterations_/numCpHits[i];
 
-      const char *unitPtr(Checkpoint::NANO_SEC_STR.c_str());
       uint64_t totalCycles(avgCp->totalCycles_);
       uint64_t avgCycles((uint64_t) (avgCp->totalCycles_/avgCp->iterations_));
-
-      if(avgCycles > 999999 && totalCycles > 9999999)
-      {
-        totalCycles /= 1000000000;
-        avgCycles   /= 1000000000;
-        unitPtr = Checkpoint::SECOND_STR.c_str();
-      }
-      else if(avgCycles > 9999 && totalCycles > 99999)
-      {
-   	    totalCycles /= 1000;
-        avgCycles   /= 1000;
-   	    unitPtr = Checkpoint::MICRO_SEC_STR.c_str();
-      }
+      const char *unitPtr(getTimeResolutionStr(avgCycles, totalCycles));
 
       cout << "Weighted Average: Checkpoint [" << i
            << "] Iterations [" << avgCp->iterations_
@@ -240,11 +249,10 @@ void Checkpoint::dump()
   }
 
   // Now print the threadId map
-  cout << "\nTreadId map[" << threadIdCounter_ << "]" << endl;
-  Checkpoint::ThreadIdMapType::iterator iter;
-  for(iter = threadIdMap_.begin(); iter != threadIdMap_.end(); ++iter)
+  cout << "\nTreadIds [" << threadIdCounter_ << "]" << endl;
+  for(int i = 0; i < threadIdCounter_; ++i)
   {
-    cout << "\t treadId [" << iter->first << "] => index [" << iter->second << "]\n";
+    cout << "\t thread [" << i << "] => threadId [" << threadIdVector_[i] << "]\n";
   }
   cout << endl;
 

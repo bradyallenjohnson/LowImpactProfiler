@@ -11,6 +11,13 @@
 #include <pthread.h>
 #include <time.h>
 #include <stdint.h> // uint32_t et al
+#include <stdlib.h> // exit()
+
+#include <errno.h>
+#include <string.h>  // strerror()
+
+#include <sys/time.h>      // rlimit()
+#include <sys/resource.h>  // rlimit()
 
 #include <CmdLineParser.h>
 
@@ -73,6 +80,19 @@ bool parseCommandLine(int argc, char **argv, CmdLineParser &clp, ConfigInput &co
   config.numLoops     =  ((CmdLineOptionInt*)   clp.getCmdLineOption(ARG_NUM_LOOPS))->getValue();
   config.lipLocking   =  ((CmdLineOptionFlag*)  clp.getCmdLineOption(ARG_LIP_LOCKING))->getValue();
 
+  // Check that the number of threads configured is not too high for the system
+  struct rlimit rlimit;
+  if(getrlimit(RLIMIT_NPROC, &rlimit) != 0)
+  {
+    cerr << "ERROR in getrlimit()" << endl;
+  }
+
+  if(config.numThreads >= rlimit.rlim_cur)
+  {
+    cerr << "Number of threads specified is higher than allowed by the system limit: " << rlimit.rlim_cur << endl;
+    return false;
+  }
+
   return true;
 }
 
@@ -84,13 +104,13 @@ void *threadEntryPoint(void *userData)
 
   for(int i = 0; i < config->numLoops; ++i)
   {
-	CHECKPOINT(1);
-	// This one will tell us how long a single checkpoint takes
-	CHECKPOINT(2);
+    CHECKPOINT(1);
+    // This one will tell us how long a single checkpoint takes
+    CHECKPOINT(2);
 
-	usleep(config->sleepMicros);
+    usleep(config->sleepMicros);
 
-	CHECKPOINT(3);
+    CHECKPOINT(3);
   }
 
   CHECKPOINT(4);
@@ -123,8 +143,8 @@ int main(int argc, char **argv)
   ConfigInput input;
   if(!parseCommandLine(argc, argv, clp, input))
   {
-	cerr << "Error parsing command line arguments, exiting" << endl;
-	return 1;
+    cerr << "Error parsing command line arguments, exiting" << endl;
+    return 1;
   }
 
   cout << "\nThe threads should take at least (numLoops * microSleepTime) = (" << input.numLoops
@@ -139,7 +159,14 @@ int main(int argc, char **argv)
   pthread_t threadIds[input.numThreads];
   for(int i = 0; i < input.numThreads; ++i)
   {
-    pthread_create(&threadIds[i], NULL, threadEntryPoint, (void*) &input);
+    int retval(pthread_create(&threadIds[i], NULL, threadEntryPoint, (void*) &input));
+    if(retval != 0)
+    {
+      cerr << "ERROR creating threads: pthread_create() returned error [" << retval << "] " << strerror(retval)
+           << ", exiting"
+           << endl;
+      exit(1);
+    }
     printTime("Created thread", threadIds[i]);
   }
 
