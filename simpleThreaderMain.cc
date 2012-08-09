@@ -181,6 +181,7 @@ int main(int argc, char **argv)
   printTime("\nAll threads finished");
 
   Checkpoint::instance()->dump();
+  Checkpoint::destroy();
 
   printTime("All finished");
 

@@ -42,6 +42,17 @@ Checkpoint* Checkpoint::instance()
   return instance_;
 }
 
+// static
+// This method is not thread-safe, so it must only be called when all the threads are finished
+void Checkpoint::destroy()
+{
+  if(instance_ == 0)
+  {
+    delete instance_;
+    instance_ = 0;
+  }
+}
+
 // protected
 Checkpoint::Checkpoint(uint32_t numThreads) :
     numThreads_(numThreads),

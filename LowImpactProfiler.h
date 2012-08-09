@@ -30,6 +30,9 @@ class Checkpoint
     // The Checkpoint object is a singleton, this method obtains the instance
     static Checkpoint* instance();
 
+    // Destroy the singleton instance
+    statid void destroy();
+
     // Both instance() and initialize() will initialize the checkpoints
     // but Init provides more flexibility
     // - locking is only necessary if dump() will be called while checkpoints are being taken
