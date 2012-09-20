@@ -13,6 +13,7 @@ Checkpoint *Checkpoint::instance_ = 0;
 bool Checkpoint::useLocking_ = true;
 const string Checkpoint::SECOND_STR    = "Seconds";
 const string Checkpoint::MICRO_SEC_STR = "MicroSec";
+const string Checkpoint::MILLI_SEC_STR = "MilliSec";
 const string Checkpoint::NANO_SEC_STR  = "NanoSec";
 
 using namespace std;
@@ -43,14 +44,15 @@ Checkpoint* Checkpoint::instance()
 }
 
 // static
+// Destroys the Singleton instance
 // This method is not thread-safe, so it must only be called when all the threads are finished
 void Checkpoint::destroy()
 {
-  if(instance_ == 0)
+  if(instance_ != 0)
   {
     delete instance_;
-    instance_ = 0;
   }
+  instance_ = 0;
 }
 
 // protected
@@ -69,21 +71,50 @@ Checkpoint::Checkpoint(uint32_t numThreads) :
   }
 
   pthread_mutex_init(&checkpointLock_, NULL); // initialize it even if !useLocking_
-  pthread_rwlock_init(&threadCpInfoMapRwLock_, NULL);
+  pthread_rwlockattr_init(&rwlockAttr_);
+  // give priority to writers
+  pthread_rwlockattr_setkind_np(&rwlockAttr_, PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP);
+  pthread_rwlock_init(&threadCpInfoMapRwLock_, &rwlockAttr_);
 
-  threadIdVector_.reserve(numThreads);
+  if(numThreads > 1)
+  {
+    threadIdVector_.reserve(numThreads);
+  }
+  else
+  {
+    threadIdVector_.reserve(1);
+  }
+}
+
+Checkpoint::~Checkpoint()
+{
+  pthread_rwlockattr_destroy(&rwlockAttr_);
+  pthread_rwlock_destroy(&threadCpInfoMapRwLock_);
+  pthread_mutex_destroy(&checkpointLock_);
 }
 
 // private
 Checkpoint::ThreadCheckpointInfo *Checkpoint::getThreadCpInfo()
 {
-  pthread_t threadId(pthread_self());
   ThreadCheckpointInfo *threadCpInfo(NULL);
 
+  if(numThreads_ == 0)
+  {
+    if(__unlikely(threadCpInfoMap_.empty()))
+    {
+      threadCpInfoMap_[0] = ThreadCheckpointInfo();
+      threadIdVector_[threadIdCounter_++] = 0;
+    }
+    threadCpInfo = &(threadCpInfoMap_[0]);
+
+    return threadCpInfo;
+  }
+
+  pthread_t threadId(pthread_self());
   pthread_rwlock_rdlock(&threadCpInfoMapRwLock_);
   Checkpoint::ThreadCpInfoMapType::iterator iter(threadCpInfoMap_.find(threadId));
 
-  if(iter != threadCpInfoMap_.end())
+  if(__likely(iter != threadCpInfoMap_.end()))
   {
     threadCpInfo = &(iter->second);
     pthread_rwlock_unlock(&threadCpInfoMapRwLock_);
@@ -135,35 +166,36 @@ void Checkpoint::checkpoint(int checkpoint)
 
 const char *Checkpoint::getTimeResolutionStr(uint64_t &avgCycles, uint64_t &totalCycles)
 {
-  const char *unitPtr(Checkpoint::NANO_SEC_STR.c_str());
+  const char *unitPtr(Checkpoint::MICRO_SEC_STR.c_str());
 
-  if(avgCycles > 999999 && totalCycles > 9999999)
+  if(avgCycles > 99999LU && totalCycles > 999999LU)
   {
-    totalCycles /= 1000000000;
-    avgCycles   /= 1000000000;
+    totalCycles /= 1000000LU;
+    avgCycles   /= 1000000LU;
     unitPtr = Checkpoint::SECOND_STR.c_str();
   }
   else if(avgCycles > 9999 && totalCycles > 99999)
   {
     totalCycles /= 1000;
     avgCycles   /= 1000;
-    unitPtr = Checkpoint::MICRO_SEC_STR.c_str();
+    unitPtr = Checkpoint::MILLI_SEC_STR.c_str();
   }
 
   return unitPtr;
 }
 
 // Dump all the checkpoint information
-void Checkpoint::dump()
+void Checkpoint::dump(ostream &out, bool dumpAverages, bool dumpTput, bool dumpThreadIds)
 {
-  cout << "Number of Threads [configured, used] = [" << numThreads_
+  out << "Number of Threads [configured, used] = [" << numThreads_
        << ", " << threadIdCounter_
        << "]"
        << endl;
 
   struct timespec resolution;
-  clock_getres(CLOCK_THREAD_CPUTIME_ID, &resolution);
-  cout << "Timer resolution in nanoseconds [" << resolution.tv_nsec << "]" << endl;
+  //clock_getres(CLOCK_THREAD_CPUTIME_ID, &resolution);
+  clock_getres(CLOCK_REALTIME, &resolution);
+  out << "Timer resolution in nanoseconds [" << resolution.tv_nsec << "]" << endl;
 
   if(useLocking_)
   {
@@ -174,6 +206,8 @@ void Checkpoint::dump()
   uint32_t numCpHits[MAX_CHECKPOINT];
   memset(numCpHits, 0, sizeof(uint32_t)*MAX_CHECKPOINT);
 
+  // Print a summary of the Checkpoints for each Thread
+  //
   // Iterate over the vector and index the map, because if we iterate the map
   // the key is the threadId and the threads will be ordered by the threadId
   for(int thread = 0; thread < threadIdCounter_; ++thread)
@@ -193,7 +227,7 @@ void Checkpoint::dump()
 
     if(!threadUsed)
     {
-      //cout << "Thread [" << thread << "] No checkpoints hit on this thread, skipping\n" << endl;
+      //out << "Thread [" << thread << "] No checkpoints hit on this thread, skipping\n" << endl;
       continue;
     }
 
@@ -213,7 +247,7 @@ void Checkpoint::dump()
     }
 
     currentCp = threadCp->checkpoints_;
-    for(int chkPoint=0; chkPoint < maxCpIndex; currentCp = &(threadCp->checkpoints_[++chkPoint]))
+    for(int checkPoint=0; checkPoint < maxCpIndex; currentCp = &(threadCp->checkpoints_[++checkPoint]))
     {
       uint64_t avgCycles(0);
 
@@ -221,54 +255,110 @@ void Checkpoint::dump()
       {
         // Avoiding possible divide by zero
         avgCycles = currentCp->totalCycles_/currentCp->iterations_;
-        totalCpAvg[chkPoint] += currentCp;
-        numCpHits[chkPoint]++;
+        totalCpAvg[checkPoint] += currentCp;
+        numCpHits[checkPoint]++;
       }
 
       uint64_t totalCycles(currentCp->totalCycles_);
       const char *unitPtr(getTimeResolutionStr(avgCycles, totalCycles));
 
-      cout << "Thread [" << thread
-           << "] Checkpoint [" << chkPoint
+      out << "Thread [" << thread
+           << "] Checkpoint [" << checkPoint
            << "] Iterations [" << currentCp->iterations_
            << "] Time [Unit,Avg,Total] = [" << unitPtr
            << ", " << avgCycles
            << ", " << totalCycles << "]\n";
     }
-    cout << endl;
+    out << endl;
   }
 
   // Now print the averages
-  for(int i = 0; i < MAX_CHECKPOINT; ++i)
+  if(dumpAverages)
   {
-    CheckpointInfo *avgCp = &(totalCpAvg[i]);
-    if(numCpHits[i] > 1)
+    for(int i = 0; i < MAX_CHECKPOINT; ++i)
     {
-      avgCp->totalCycles_ = avgCp->totalCycles_/numCpHits[i];
-      avgCp->iterations_ = avgCp->iterations_/numCpHits[i];
+      CheckpointInfo *avgCp = &(totalCpAvg[i]);
+      if(numCpHits[i] > 1)
+      {
+        avgCp->totalCycles_ = avgCp->totalCycles_/numCpHits[i];
+        avgCp->iterations_ = avgCp->iterations_/numCpHits[i];
 
-      uint64_t totalCycles(avgCp->totalCycles_);
-      uint64_t avgCycles((uint64_t) (avgCp->totalCycles_/avgCp->iterations_));
-      const char *unitPtr(getTimeResolutionStr(avgCycles, totalCycles));
+        uint64_t totalCycles(avgCp->totalCycles_);
+        uint64_t avgCycles((uint64_t) (avgCp->totalCycles_/avgCp->iterations_));
+        const char *unitPtr(getTimeResolutionStr(avgCycles, totalCycles));
 
-      cout << "Weighted Average: Checkpoint [" << i
-           << "] Iterations [" << avgCp->iterations_
-           << "] Time [Unit,Avg,Total] = [" << unitPtr
-           << ", " << avgCycles
-           << ", " << totalCycles << "]\n";
+        out << "Weighted Average: Checkpoint [" << i
+             << "] Iterations [" << avgCp->iterations_
+             << "] Time [Unit,Avg,Total] = [" << unitPtr
+             << ", " << avgCycles
+             << ", " << totalCycles << "]\n";
+      }
     }
   }
 
-  // Now print the threadId map
-  cout << "\nTreadIds [" << threadIdCounter_ << "]" << endl;
-  for(int i = 0; i < threadIdCounter_; ++i)
+  // Now print the approximated Throughput
+  if(dumpTput)
   {
-    cout << "\t thread [" << i << "] => threadId [" << threadIdVector_[i] << "]\n";
+    dumpThroughput(out);
   }
-  cout << endl;
+
+  // Now print the threadId map
+  if(dumpThreadIds)
+  {
+    out << "\nTreadIds [" << threadIdCounter_ << "]" << endl;
+    for(int i = 0; i < threadIdCounter_; ++i)
+    {
+      out << "\t thread [" << i << "] => threadId [" << threadIdVector_[i] << "]\n";
+    }
+    out << endl;
+  }
 
   if(useLocking_)
   {
     pthread_mutex_unlock(&checkpointLock_);
   }
+}
+
+void Checkpoint::dumpThroughput(ostream &out)
+{
+  // Thread 0 is the first thread created, so its creation time
+  // will be the start time for the throughput calculation
+  ThreadCheckpointInfo *threadZeroCps(&(threadCpInfoMap_[threadIdVector_[0]]));
+
+  // Assuming all threads have hit the same checkpoints,
+  // so lets get the last checkpoint hit from thread 0
+  int maxCpIndex(MAX_CHECKPOINT);
+  CheckpointInfo *currentCp = &(threadZeroCps->checkpoints_[MAX_CHECKPOINT-1]);
+  for(int checkPoint = MAX_CHECKPOINT; checkPoint > 0; currentCp = &(threadZeroCps->checkpoints_[--checkPoint]))
+  {
+    if(currentCp->iterations_ != 0)
+    {
+      maxCpIndex = checkPoint;
+      break;
+    }
+  }
+
+  out << "\nThroughput for each thread cp[" << maxCpIndex << "]:\n";
+
+  // Now get the greatest previousCycles from the last checkpoint hit to get the endTime
+  // Iterate over the vector and index the map
+  float totalThroughput(0);
+  for(int thread = 0; thread < threadIdCounter_; ++thread)
+  {
+    ThreadCheckpointInfo *threadCp = &(threadCpInfoMap_[threadIdVector_[thread]]);
+    uint64_t startTime(threadCp->creationCycles_);
+    uint64_t endTime(threadCp->checkpoints_[maxCpIndex].previousCycles_);
+    uint64_t iterations(threadCp->checkpoints_[maxCpIndex].iterations_);
+    float throughput = (iterations/((float) (endTime - startTime)/1000000.0));
+    totalThroughput += throughput;
+
+    out << "Thread[" << thread << "] Time usec [start, end, diff] = [" << startTime
+        << ", " << endTime
+        << ", " << (endTime - startTime)
+        << "], iterations = " << iterations
+        << ", throughput (iters/sec) = " << throughput
+        << endl;
+  }
+
+  out << "\nTotal Throughput (iters/sec) = " << totalThroughput << endl;
 }
