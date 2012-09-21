@@ -7,6 +7,7 @@
 
 #include <string>
 #include <iostream>
+#include <sstream>
 
 #include <time.h>
 #include <stdint.h> // uint32_t et al
@@ -186,8 +187,14 @@ int main(int argc, char **argv)
 
   printTime("\nWork finished", start, end);
 
-  Checkpoint::instance()->dump(true, true, true);
+  Checkpoint::instance()->dump(true, true, true, true);
+
+  cout << "Now for minimal checkpoints" << endl;
+
+  ostringstream cpStream;
+  Checkpoint::instance()->dump(cpStream, false);
   Checkpoint::destroy();
+  cout << cpStream.str() << endl;
 
   printTime("All finished");
 

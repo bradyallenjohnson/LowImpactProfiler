@@ -185,17 +185,23 @@ const char *Checkpoint::getTimeResolutionStr(uint64_t &avgCycles, uint64_t &tota
 }
 
 // Dump all the checkpoint information
-void Checkpoint::dump(ostream &out, bool dumpAverages, bool dumpTput, bool dumpThreadIds)
+void Checkpoint::dump(ostream &out, bool verbose, bool dumpAverages, bool dumpTput, bool dumpThreadIds)
 {
-  out << "Number of Threads [configured, used] = [" << numThreads_
-       << ", " << threadIdCounter_
-       << "]"
-       << endl;
+  if(verbose)
+  {
+    out << "Number of Threads [configured, used] = [" << numThreads_
+        << ", " << threadIdCounter_
+        << "]"
+        << endl;
+  }
 
-  struct timespec resolution;
-  //clock_getres(CLOCK_THREAD_CPUTIME_ID, &resolution);
-  clock_getres(CLOCK_REALTIME, &resolution);
-  out << "Timer resolution in nanoseconds [" << resolution.tv_nsec << "]" << endl;
+  if(verbose)
+  {
+    struct timespec resolution;
+    //clock_getres(CLOCK_THREAD_CPUTIME_ID, &resolution);
+    clock_getres(CLOCK_REALTIME, &resolution);
+    out << "Timer resolution in nanoseconds [" << resolution.tv_nsec << "]" << endl;
+  }
 
   if(useLocking_)
   {
@@ -262,12 +268,26 @@ void Checkpoint::dump(ostream &out, bool dumpAverages, bool dumpTput, bool dumpT
       uint64_t totalCycles(currentCp->totalCycles_);
       const char *unitPtr(getTimeResolutionStr(avgCycles, totalCycles));
 
-      out << "Thread [" << thread
-           << "] Checkpoint [" << checkPoint
-           << "] Iterations [" << currentCp->iterations_
-           << "] Time [Unit,Avg,Total] = [" << unitPtr
-           << ", " << avgCycles
-           << ", " << totalCycles << "]\n";
+      if(verbose)
+      {
+        out << "Thread [" << thread
+            << "] Checkpoint [" << checkPoint
+            << "] Iterations [" << currentCp->iterations_
+            << "] Time [Unit,Avg,Total] = [" << unitPtr
+            << ", " << avgCycles
+            << ", " << totalCycles << "]\n";
+      }
+      else
+      {
+        // minimalCheckpoint format:
+        // Iters0=20, MicroSec0=300, Iters1=10, MilliSec1=400, Iters2=10, MilliSec2=800
+        if(checkPoint != 0)
+        {
+          out << ", ";
+        }
+        out << "Iters" << checkPoint << "=" << currentCp->iterations_
+            << ", " << unitPtr << checkPoint << "=" << totalCycles;
+      }
     }
     out << endl;
   }

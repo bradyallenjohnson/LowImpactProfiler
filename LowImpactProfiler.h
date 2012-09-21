@@ -46,11 +46,18 @@ class Checkpoint
     void checkpoint(int checkpoint);
 
     // Dump the checkpoint info gathered to cout
-    inline void dump(bool dumpAverages = false, bool dumpThroughput = false, bool dumpThreadIds = false) {
-      dump(cout, dumpAverages, dumpThroughput, dumpThreadIds);
+    inline void dump(bool verbose = true,
+                     bool dumpAverages = false,
+                     bool dumpThroughput = false,
+                     bool dumpThreadIds = false) {
+      dump(cout, verbose, dumpAverages, dumpThroughput, dumpThreadIds);
     }
     // Dump the checkpoint info gathered to the ostream provided
-    void dump(ostream &out, bool dumpAverages = false, bool dumpThroughput = false, bool dumpThreadIds = false);
+    void dump(ostream &out,
+              bool verbose = true,
+              bool dumpAverages = false,
+              bool dumpThroughput = false,
+              bool dumpThreadIds = false);
     void dumpThroughput(ostream &out);
 
     ~Checkpoint();
